@@ -29,18 +29,8 @@ import socket
 import threading
 from datetime import datetime
 
-# Only allow testing on your local network
-ALLOWED_NETS = ["192.168.0.", "127.0.0.", "10.0."]
-
-
-def check_target(ip):
-    """Only allow local network targets."""
-    for net in ALLOWED_NETS:
-        if ip.startswith(net):
-            return True
-    print(f"\n  ❌ BLOCKED: {ip} is not in your local network.")
-    print(f"     This tool only works on: {', '.join(ALLOWED_NETS)}")
-    return False
+# Warning: Only use against systems you OWN or have WRITTEN CONSENT to test.
+# Using this against other people's systems is ILLEGAL.
 
 
 def syn_flood(target_ip, duration):
@@ -194,9 +184,6 @@ if __name__ == "__main__":
     target = sys.argv[1]
     method = sys.argv[2].lower()
     duration = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-
-    if not check_target(target):
-        sys.exit(1)
 
     print(f"\n  🛡️  Network Stress Test")
     print(f"  {'=' * 40}")
