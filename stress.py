@@ -47,10 +47,10 @@ class SynFactory:
         seq = random.randrange(0, 0xFFFFFFFF)
         ip_id = random.randrange(0, 0xFFFF)
 
-        ip = struct.pack("!BBHHHBBIH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, 0)
+        ip = struct.pack("!BBHHHBBH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, 0)
         ip += saddr + self.dip
         ck = self._cksum(ip)
-        ip = struct.pack("!BBHHHBBIH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, ck)
+        ip = struct.pack("!BBHHHBBH", 0x45, 0, 40, ip_id, 0x4000, 64, 6, ck)
         ip += saddr + self.dip
 
         tcp = struct.pack("!HHIIBBHHH", sport, dport, seq, 0, 0x50, 0x02, 65535, 0, 0)
