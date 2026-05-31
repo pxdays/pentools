@@ -203,11 +203,6 @@ if __name__ == "__main__":
     }
 
     if method in methods:
-        if method == "syn-flood":
-            print(
-                f"\n  Need sudo for SYN flood. Run: sudo python3 stress.py {target} {method} {duration}"
-            )
-            sys.exit(1)
         methods[method](target, duration)
     else:
         print(f"  ❌ Unknown method: {method}")
