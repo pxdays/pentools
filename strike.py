@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """strike — launch local + cloud attacks in one command."""
 
-import sys, os, time, subprocess, threading, json, signal
+import sys, os, time, subprocess, threading, json, signal, pwd
 from datetime import datetime
 
 BANNER = "  strike — coordinated attack"
 
-HOME = os.environ.get("HOME", "/home/joshuam")
+# sudo changes HOME — resolve real user's home from SUDO_USER or passwd
+_real_user = os.environ.get("SUDO_USER") or os.environ.get("USER") or "joshuam"
+try:
+    HOME = pwd.getpwnam(_real_user).pw_dir
+except KeyError:
+    HOME = os.environ.get("HOME", "/home/joshuam")
 LOCAL = f"{HOME}/pentools/stress.py"
 LOG = "/tmp/strike.log"
 GH_BIN = f"{HOME}/bin/gh"
